@@ -68,7 +68,7 @@ app.post('/tickets/reply', async (req, res) => {
       port: 465,  // SMTP port
       secure: true, // Use SSL/TLS
       auth: {
-        user: process.env.EMAIL, // Your email (informática@delvalle.edu.ar)
+        user: process.env.EMAIL, 
         pass: process.env.PASSWORD, // Your email password (or app-specific password)
       }
     });
