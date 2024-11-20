@@ -214,7 +214,7 @@ app.post('/tickets', auth, async (req, res) => {
 
 // Route to reply to a ticket
 app.post('/tickets/reply', auth, async (req, res) => {
-  const { ticketId, replyMessage } = req.body;
+  const { ticketId, replyMessage, inReplyTo, references } = req.body;
 
   try {
     // Find the ticket by ID
@@ -225,16 +225,30 @@ app.post('/tickets/reply', auth, async (req, res) => {
     }
 
     // Add the reply to the ticket history
-    ticket.history.push({
+    const messageId = uuidv4(); // Generate a unique messageId for the new reply
+
+    // If it's a reply to a previous reply, set inReplyTo to the previous reply's messageId
+    const newReply = {
       content: replyMessage,
       date: new Date(),
       sender: req.user.username, // Ensure the sender is the logged-in user
-    });
+      messageId,  // The unique ID for the new reply
+      inReplyTo,  // Message ID this reply is responding to
+      references: references || [], // Ensure references is set, even if it's an empty array
+    };
 
-    // Save the updated ticket with the new reply in history
-    const updatedTicket = await ticket.save();  // Save the ticket and return the updated ticket
+    ticket.history.push(newReply);
 
-    // Set up and send the email notification for the reply
+    // Log the updated ticket history before saving
+    console.log("Updated ticket history:", ticket.history);
+
+    // Save the updated ticket
+    const updatedTicket = await ticket.save();
+
+    // Log the updated ticket object
+    console.log("Updated ticket after save:", updatedTicket);
+
+    // Send email notification to the ticket sender (to notify them about the reply)
     const transporter = nodemailer.createTransport({
       host: 'mr.fibercorp.com.ar',
       port: 465,
@@ -244,7 +258,7 @@ app.post('/tickets/reply', auth, async (req, res) => {
         pass: process.env.PASSWORD,
       },
       tls: {
-        rejectUnauthorized: false, // Disable SSL validation for self-signed certs
+        rejectUnauthorized: false,
       },
     });
 
@@ -252,16 +266,16 @@ app.post('/tickets/reply', auth, async (req, res) => {
       from: process.env.EMAIL,
       to: ticket.sender,
       subject: `Re: ${ticket.subject}`,
-      text: replyMessage,
+      text: replyMessage, // The content of the reply message
     };
 
     await transporter.sendMail(mailOptions);
 
-    // Send the updated ticket back to the frontend
-    res.status(200).json(updatedTicket);  // Return the updated ticket instead of just a success message
+    // Return the updated ticket with the history included
+    res.status(200).json(updatedTicket);
   } catch (err) {
-    console.error('Error sending reply:', err);
-    res.status(500).json({ message: 'Error sending reply', error: err.message });
+    console.error('Error replying to ticket:', err);
+    res.status(500).json({ message: 'Error replying to ticket', error: err.message });
   }
 });
 
