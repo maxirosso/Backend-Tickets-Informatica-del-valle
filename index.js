@@ -26,25 +26,29 @@ mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopol
 
 // Ticket model (added messageId field to match emails)
 const ticketSchema = new mongoose.Schema({
-  subject: String,
-  sender: String,
-  content: String,
+  subject: { type: String, required: true },
+  sender: { type: String, required: true },
+  content: { type: String, required: true },
   date: { type: Date, default: Date.now },
-  messageId: String,         // Unique ID of the original email message
-  inReplyTo: String,         // ID of the message this one is in reply to
-  references: [String],      // Array of messageIds in the conversation thread
+  messageId: { type: String, required: true }, // Unique ID of the original email message
+  inReplyTo: { type: String }, // ID of the message this one is in reply to
+  references: { type: [String], default: [] }, // Array of messageIds in the conversation thread
+  status: {
+    type: String,
+    enum: ['Pendiente', 'En Proceso', 'Resuelto'],
+    default: 'Pendiente', // Default status for a new ticket
+  },
   history: [
     {
-      content: String,
-      date: Date,
-      sender: String,
-      messageId: String,      // Unique ID for this specific history message
-      inReplyTo: String,      // messageId of the previous message in the thread
-      references: [String],   // Array of messageIds up to this point in the conversation
+      content: { type: String, required: true },
+      date: { type: Date, default: Date.now },
+      sender: { type: String, required: true },
+      messageId: { type: String, required: true }, // Unique ID for this specific history message
+      inReplyTo: { type: String }, // messageId of the previous message in the thread
+      references: { type: [String], default: [] }, // Array of messageIds up to this point in the conversation
     },
   ],
 });
-
 
 const Ticket = mongoose.model('Ticket', ticketSchema);
 
@@ -152,14 +156,25 @@ app.post('/tickets', auth, async (req, res) => {
   const { subject, sender, content, inReplyTo, references } = req.body;
 
   try {
-    let ticket;
+    // Clean the sender to only capture the email address, not the name
+    const cleanedSender = sender.includes('<') ? sender.split('<')[1].replace('>', '') : sender;
 
-    // Generate a new messageId for the ticket or reply (if not provided in the request body)
-    const messageId = uuidv4();
+    // Optionally, clean the content to handle any HTML, embedded images, etc.
+    const cleanedContent = content.replace(/<\/?[^>]+(>|$)/g, "");  // Removes HTML tags
+
+    // Generate a new messageId for the ticket or reply (for new tickets)
+    const messageId = uuidv4(); 
+
+    // Assign default values if not provided in the request
+    const finalInReplyTo = inReplyTo || null; // If inReplyTo is not provided, set to null
+    const finalReferences = references ? references.split(' ') : []; // Split references if provided, otherwise empty array
+    const status = "Pendiente"; // Default status for new tickets
+
+    let ticket;
 
     // Try to find a matching ticket based on inReplyTo or references
     if (inReplyTo) {
-      // Find the ticket where messageId is either in the history or as the primary messageId
+      // Find ticket by inReplyTo (e.g., if this is a reply to an existing ticket)
       ticket = await Ticket.findOne({
         $or: [
           { messageId: inReplyTo },       // Check if the inReplyTo is the main messageId
@@ -182,28 +197,29 @@ app.post('/tickets', auth, async (req, res) => {
     if (ticket) {
       // If a matching ticket is found, add the new message to the history
       ticket.history.push({
-        content,
+        content: cleanedContent,  // Use the cleaned content
         date: new Date(),
-        sender,
-        messageId, // Ensure the messageId is unique and correctly assigned
-        inReplyTo,  // This links the reply to the original message
-        references: references ? references.split(' ') : [], // Maintain references
+        sender: cleanedSender,    // Use the cleaned sender (email only)
+        messageId,               // Ensure the messageId is unique and correctly assigned
+        inReplyTo: finalInReplyTo, // This links the reply to the original message
+        references: finalReferences, // Maintain references
       });
       await ticket.save();
-      return res.status(200).json({ message: 'Ticket updated successfully' });
+      return res.status(200).json({ message: 'Ticket updated successfully', ticket });
     } else {
       // If no ticket found, create a new ticket (fallback)
       const newTicket = new Ticket({
         subject,
-        sender,
-        content,
-        messageId, // The first message's unique ID
-        inReplyTo,
-        references: references ? references.split(' ') : [],
-        history: [{ content, sender, date: new Date(), messageId, inReplyTo, references: references ? references.split(' ') : [] }],
+        sender: cleanedSender,  // Store only the email address, not the name
+        content: cleanedContent, // Clean the content to remove any HTML
+        messageId,              // The first message's unique ID
+        inReplyTo: finalInReplyTo, // Assign finalInReplyTo (null if not provided)
+        references: finalReferences, // Assign references (empty array if not provided)
+        status,  // Default status for new tickets
+        history: []  // Initialize history as an empty array for the first message
       });
       await newTicket.save();
-      return res.status(201).json({ message: 'Ticket saved successfully' });
+      return res.status(201).json({ message: 'Ticket saved successfully', ticket: newTicket });
     }
   } catch (err) {
     console.error('Error saving or updating ticket:', err);
@@ -212,72 +228,91 @@ app.post('/tickets', auth, async (req, res) => {
 });
 
 
+
+
+
+
 // Route to reply to a ticket
-app.post('/tickets/reply', auth, async (req, res) => {
-  const { ticketId, replyMessage, inReplyTo, references } = req.body;
+ // Ensure you have the UUID library imported
+
+ app.post('/tickets/reply', auth, async (req, res) => {
+  const { ticketId, replyMessage, messageId, inReplyTo, references, status } = req.body;
 
   try {
-    // Find the ticket by ID
-    const ticket = await Ticket.findById(ticketId);
-    if (!ticket) {
-      console.log('Ticket not found');
-      return res.status(404).json({ message: 'Ticket not found' });
+    // Validar que ticketId y replyMessage estén presentes
+    if (!ticketId || !replyMessage) {
+      return res.status(400).json({ message: "Ticket ID y mensaje de respuesta son requeridos." });
     }
 
-    // Add the reply to the ticket history
-    const messageId = uuidv4(); // Generate a unique messageId for the new reply
+    // Validar que messageId esté presente
+    if (!messageId) {
+      return res.status(400).json({ message: "messageId es requerido." });
+    }
 
-    // If it's a reply to a previous reply, set inReplyTo to the previous reply's messageId
+    // Buscar el ticket por ID
+    const ticket = await Ticket.findById(ticketId);
+    if (!ticket) {
+      return res.status(404).json({ message: "Ticket no encontrado" });
+    }
+
+    // Construir el nuevo objeto de respuesta
     const newReply = {
       content: replyMessage,
       date: new Date(),
-      sender: req.user.username, // Ensure the sender is the logged-in user
-      messageId,  // The unique ID for the new reply
-      inReplyTo,  // Message ID this reply is responding to
-      references: references || [], // Ensure references is set, even if it's an empty array
+      sender: req.user.username || "System", // Asignar el remitente
+      messageId, // Usar el messageId proporcionado
+      inReplyTo: inReplyTo || null,
+      references: references || ticket.references || [], // Usar referencias si se pasan
     };
 
+    // Verificar que el messageId esté presente en el objeto newReply
+    console.log("Nuevo mensaje de respuesta:", newReply);
+
+    // Agregar la respuesta al historial del ticket
     ticket.history.push(newReply);
 
-    // Log the updated ticket history before saving
-    console.log("Updated ticket history:", ticket.history);
+    // Verificar el historial del ticket antes de guardarlo
+    console.log("Historial del ticket antes de guardar:", ticket.history);
 
-    // Save the updated ticket
+    // Establecer el estado del ticket (si es necesario)
+    ticket.status = status || "Pendiente"; // Usar el status proporcionado o por defecto "Pendiente"
+
+    // Guardar el ticket con el historial actualizado
     const updatedTicket = await ticket.save();
 
-    // Log the updated ticket object
-    console.log("Updated ticket after save:", updatedTicket);
-
-    // Send email notification to the ticket sender (to notify them about the reply)
+    // Enviar correo electrónico si es necesario
     const transporter = nodemailer.createTransport({
-      host: 'mr.fibercorp.com.ar',
+      host: "mr.fibercorp.com.ar",
       port: 465,
       secure: true,
       auth: {
         user: process.env.EMAIL,
         pass: process.env.PASSWORD,
       },
-      tls: {
-        rejectUnauthorized: false,
-      },
+      tls: { rejectUnauthorized: false },
     });
 
     const mailOptions = {
       from: process.env.EMAIL,
       to: ticket.sender,
       subject: `Re: ${ticket.subject}`,
-      text: replyMessage, // The content of the reply message
+      text: `Has recibido una nueva respuesta: \n\n${replyMessage}`,
     };
 
     await transporter.sendMail(mailOptions);
 
-    // Return the updated ticket with the history included
+    // Responder con el ticket actualizado
     res.status(200).json(updatedTicket);
   } catch (err) {
-    console.error('Error replying to ticket:', err);
-    res.status(500).json({ message: 'Error replying to ticket', error: err.message });
+    console.error("Error al responder al ticket:", err.message);
+    res.status(500).json({ message: "Error al responder al ticket", error: err.message });
   }
 });
+
+
+
+
+
 
 app.get('/tickets/:id/history', auth, async (req, res) => {
   const { id } = req.params;
@@ -310,57 +345,83 @@ app.delete('/tickets/:id', auth, async (req, res) => {
   }
 });
 
-app.put('/tickets/:id/reply', auth, async (req, res) => {
-  console.log("Reply endpoint hit");
-  const { id } = req.params; // Ticket ID from URL
-  const { replyMessage, inReplyTo, references, messageId } = req.body; // Extract necessary fields
+app.post('/api/tickets/status/:id', async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body; // 'pendiente', 'resuelto', or 'en proceso'
+
+  // Validate the status
+  if (!['pendiente', 'resuelto', 'en proceso'].includes(status)) {
+    return res.status(400).json({ message: 'Invalid status value.' });
+  }
 
   try {
-    // Find the ticket by ID
+    // Find the ticket by ID and update the status
+    const ticket = await Ticket.findByIdAndUpdate(
+      id,
+      { status },
+      { new: true } // Return the updated ticket
+    );
+
+    if (!ticket) {
+      return res.status(404).json({ message: 'Ticket not found.' });
+    }
+
+    // Determine if the buttons should remain visible
+    const canShowHistorialButtons = true; // Set this based on your desired logic
+
+    // Respond with the updated ticket and visibility status
+    res.json({
+      ticket,
+      canShowHistorialButtons, // Explicitly include this flag for frontend handling
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
+
+
+app.put('/tickets/:id/reply', auth, async (req, res) => {
+  const { id } = req.params;
+  const { replyMessage, inReplyTo, references, messageId } = req.body;
+
+  try {
+    // Validación de campos necesarios
+    if (!replyMessage || !messageId) {
+      return res.status(400).json({ message: "'replyMessage' and 'messageId' are required." });
+    }
+
+    // Validación del ID del ticket
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid ticket ID." });
+    }
+
+    // Buscar el ticket por ID
     const ticket = await Ticket.findById(id);
     if (!ticket) {
-      return res.status(404).json({ message: 'Ticket not found' });
+      return res.status(404).json({ message: "Ticket not found." });
     }
 
-    // Log incoming data for debugging purposes
-    console.log('Received reply:', { replyMessage, inReplyTo, references, messageId });
+    // Inicializar historial si no existe
+    if (!ticket.history) ticket.history = [];
 
-    // Ensure there's a history array in the ticket, initialize if necessary
-    if (!ticket.history) {
-      ticket.history = [];
-    }
-
-    // Construct the new reply object to be added to the ticket's history
+    // Añadir la respuesta al historial del ticket
     const newReply = {
-      content: replyMessage,  // The content of the reply message
-      date: new Date(),       // Date of the reply
-      sender: req.user.username, // The sender's username (from the authenticated user)
-      messageId,  // Unique ID for the message
-      inReplyTo,  // Message ID this reply is responding to (null if it's the first message)
-      references: references || [], // The message IDs to maintain the thread
+      content: replyMessage,
+      date: new Date(),
+      sender: req.user.username || 'System', // Garantizar que siempre haya un sender
+      messageId,
+      inReplyTo: inReplyTo || null,
+      references: references || [],
     };
 
-    // Add the new reply to the history
     ticket.history.push(newReply);
 
-    // Check if the reply is a reply to a previous reply
-    if (inReplyTo) {
-      console.log("This is a reply to a previous reply:", {
-        inReplyTo,
-        originalReply: ticket.history.find(reply => reply.messageId === inReplyTo),
-      });
-    }
-
-    // Log the updated ticket history before saving
-    console.log("Updated ticket history:", ticket.history);
-
-    // Save the updated ticket
+    // Guardar el ticket actualizado
     const updatedTicket = await ticket.save();
 
-    // Log the updated ticket object
-    console.log("Updated ticket after save:", updatedTicket);
-
-    // Send email notification to the ticket sender
+    // Notificación por email (si es necesario)
     const transporter = nodemailer.createTransport({
       host: 'mr.fibercorp.com.ar',
       port: 465,
@@ -376,20 +437,37 @@ app.put('/tickets/:id/reply', auth, async (req, res) => {
 
     const mailOptions = {
       from: process.env.EMAIL,
-      to: ticket.sender,
+      to: ticket.sender,  // El remitente del ticket original
       subject: `Re: ${ticket.subject}`,
-      text: replyMessage, // The content of the reply message
+      text: `Hello,\n\nA new reply has been added to your ticket:\n\n"${replyMessage}"\n\nThank you,\nSupport Team`,
     };
 
-    await transporter.sendMail(mailOptions);
-
-    // Return the updated ticket with the history included
-    res.status(200).json(updatedTicket);
+    // Enviar el correo
+    transporter.sendMail(mailOptions, (error, info) => {
+      if (error) {
+        console.error("Error sending email:", error);
+        return res.status(500).json({ message: "Reply added, but email notification failed." });
+      } else {
+        console.log("Email sent:", info.response);
+        res.status(200).json({
+          message: "Reply added successfully, and notification sent.",
+          ticket: updatedTicket,
+        });
+      }
+    });
   } catch (err) {
-    console.error('Error replying to ticket:', err);
-    res.status(500).json({ message: 'Error replying to ticket', error: err.message });
+    if (err.name === 'ValidationError') {
+      return res.status(400).json({ message: 'Validation error', errors: err.errors });
+    }
+    console.error("Error replying to ticket:", err);
+    res.status(500).json({ message: "Internal server error" });
   }
 });
+
+
+
+
+
 
 
 
