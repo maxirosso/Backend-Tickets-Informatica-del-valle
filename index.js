@@ -10,6 +10,7 @@ const { simpleParser } = require('mailparser');
 const cron = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
 
+
 dotenv.config();
 
 const app = express();
@@ -26,27 +27,25 @@ mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopol
 
 // Ticket model (added messageId field to match emails)
 const ticketSchema = new mongoose.Schema({
-  subject: String,
-  sender: String, // Original sender's email
-  content: String, // Original email content
-  messageId: { type: String, required: true }, // Unique identifier for the original email
-  inReplyTo: { type: String, default: null }, // References the messageId being replied to
-  references: { type: [String], default: [] }, // All related messageIds in the thread
-  status: { type: String, default: 'pendiente' }, // Current ticket status
+  subject: { type: String, required: true },
+  sender: { type: String, required: true },
+  content: { type: String, required: true },
+  messageId: { type: String, required: true, unique: true }, // Unique message ID from email
+  inReplyTo: { type: String, default: null }, // Used to link to the parent email
+  references: { type: [String], default: [] }, // List of related message IDs
+  status: { type: String, default: 'pendiente' }, // Current status of the ticket
   history: [
     {
-      content: String, // Reply or follow-up content
-      date: { type: Date, default: Date.now }, // Date of this history entry
-      sender: String, // Sender of the reply
-      messageId: String, // Unique identifier for this history entry
-      inReplyTo: String, // References the messageId being replied to
-      references: [String], // Cumulative thread references
-    }
+      content: { type: String, required: true }, // Email content
+      date: { type: Date, required: true }, // Timestamp for the history entry
+      sender: { type: String, required: true }, // Sender email address
+      messageId: { type: String, required: true }, // Message ID of the email in history
+      inReplyTo: { type: String, default: null }, // Parent message ID in history
+      references: { type: [String], default: [] }, // Related message IDs for this history entry
+    },
   ],
-  date: { type: Date, default: Date.now }, // Date when the ticket was created
+  date: { type: Date, default: Date.now }, // Creation date of the ticket
 });
-
-
 const Ticket = mongoose.model('Ticket', ticketSchema);
 
 // User model for authentication
@@ -476,16 +475,6 @@ app.put('/tickets/:id/reply', auth, async (req, res) => {
 
 
 
-
-
-
-
-
-// Route to update a ticket
-
-
-// IMAP connection to sync with Outlook Trash folder and delete tickets
-// IMAP connection setup
 const imap = new Imap({
   user: process.env.EMAIL,
   password: process.env.PASSWORD,
@@ -499,9 +488,9 @@ const imap = new Imap({
 let isConnected = false;  // Track IMAP connection status
 let reconnectAttempts = 0;  // Track reconnection attempts
 
-// Function to reconnect IMAP with retry delay
+// Reconnection Logic
 const reconnectImap = () => {
-  if (isConnected) return;  // Prevent reconnection if already connected
+  if (isConnected) return; // Prevent reconnection if already connected
   reconnectAttempts++;
 
   if (reconnectAttempts > 5) {
@@ -510,165 +499,178 @@ const reconnectImap = () => {
   }
 
   console.log(`Reconnecting IMAP... Attempt ${reconnectAttempts}`);
-  imap.end(); // Disconnect if any error occurred
-  setTimeout(() => imap.connect(), 2000); // Reconnect after 2 seconds
+  
+  // Remove all existing event listeners to avoid duplicates
+  imap.removeAllListeners();
+
+  // Re-register IMAP event handlers
+  registerImapEventHandlers();
+
+  // Attempt reconnection after 2 seconds
+  setTimeout(() => imap.connect(), 2000);
 };
 
-// IMAP ready event handler
-imap.once('ready', () => {
-  isConnected = true;
-  reconnectAttempts = 0; // Reset reconnection attempts on successful connection
-  console.log('IMAP connection established');
-});
+// Register IMAP Event Handlers
+const registerImapEventHandlers = () => {
+  imap.once('ready', () => {
+    isConnected = true;
+    reconnectAttempts = 0; // Reset reconnection attempts
+    console.log('IMAP connection established');
+  });
 
-// IMAP error handler
-imap.on('error', (err) => {
-  console.error('IMAP connection error:', err);
+  imap.on('error', (err) => {
+    console.error('IMAP connection error:', err);
 
-  if (err.code === 'ECONNRESET') {
-    console.log('Connection reset. Attempting to reconnect...');
+    if (err.code === 'ECONNRESET') {
+      console.log('Connection reset. Attempting to reconnect...');
+      reconnectImap();
+    } else {
+      console.error('An unexpected error occurred:', err);
+    }
+  });
+
+  imap.once('close', (hadError) => {
+    console.log(`IMAP connection closed${hadError ? ' due to an error' : ''}`);
+    isConnected = false;
     reconnectImap();
-  } else {
-    console.error('An unexpected error occurred:', err);
-  }
-});
+  });
+};
 
-// IMAP close handler
-imap.once('close', (hadError) => {
-  console.log(`IMAP connection closed${hadError ? ' due to an error' : ''}`);
-  isConnected = false;
-  reconnectImap();
-});
-
-
-// Function to parse the sender's name and email
+// Parse Sender Email Helper
 const parseSender = (senderString) => {
   const parts = senderString.includes('<') ? senderString.split('<') : [senderString];
-  let email = parts[1] ? parts[1].replace('>', '').trim() : parts[0].trim();
-
-  // Handle cases where no email is provided, but we have an email in the sender string
-  if (!email && senderString.includes('@')) {
-    email = senderString.trim();
-  }
-
-  return email || 'Unknown Sender';  // Return email or fallback to 'Unknown Sender'
+  return (parts[1] ? parts[1].replace('>', '').trim() : parts[0].trim()) || 'Unknown Sender';
 };
 
+// Check Inbox for Unseen Emails
 const checkInboxFolder = () => {
-  console.log('Checking inbox...'); // Debug log to confirm the function is called
-  if (isConnected) {
-    imap.openBox('INBOX', true, (err, box) => {
+  console.log('Checking inbox...');
+  if (!isConnected) {
+    console.log('IMAP connection is not established. Skipping sync.');
+    return;
+  }
+
+  imap.openBox('INBOX', true, (err, box) => {
+    if (err) {
+      console.error('Error opening INBOX:', err);
+      return;
+    }
+    console.log('Inbox opened in read-only mode:', box.name);
+
+    imap.search(['UNSEEN'], async (err, results) => {
       if (err) {
-        console.log('Error opening Inbox folder:', err);
+        console.error('Error searching for emails:', err);
+        return;
+      }
+      if (!results || results.length === 0) {
+        console.log('No unseen emails found.');
         return;
       }
 
-      imap.search(['UNSEEN'], async (err, results) => {
-        if (err) {
-          console.log('Error searching for emails:', err);
-          return;
-        }
+      console.log(`Found ${results.length} unseen email(s). Processing...`);
 
-        if (!results || results.length === 0) {
-          console.log('No unseen emails found.');
-          return;
-        }
+      const fetch = imap.fetch(results, {
+        bodies: ['HEADER.FIELDS (FROM SUBJECT MESSAGE-ID IN-REPLY-TO REFERENCES)', 'TEXT'],
+        struct: true,
+        markSeen: false, // Ensure emails remain unseen
+      });
 
-        const fetch = imap.fetch(results, { bodies: ['HEADER.FIELDS (FROM SUBJECT MESSAGE-ID)', 'TEXT'] });
+      fetch.on('message', (msg, seqno) => {
+        console.log(`Processing message #${seqno}`);
+        let rawEmail = '';
 
-        fetch.on('message', (msg, seqno) => {
-          msg.on('body', async (stream) => {
+        msg.on('body', (stream) => {
+          stream.on('data', (chunk) => {
+            rawEmail += chunk.toString();
+          });
+
+          stream.once('end', async () => {
             try {
-              let rawEmail = '';
-              stream.on('data', (chunk) => {
-                console.log('Data chunk received:', chunk.toString()); // Debug log for data chunk
-                rawEmail += chunk.toString();
-              });
+              const parsed = await simpleParser(rawEmail);
+              const senderEmail = parseSender(parsed.from?.text || '');
+              const messageId = parsed.messageId || `<${uuidv4()}@yourdomain.com>`;
+              const inReplyTo = parsed.inReplyTo || null;
+              const references = parsed.references || [];
+              const subject = parsed.subject || 'No Subject';
+              const content = parsed.text || parsed.html || 'No Content';
 
-              stream.once('end', async () => {
-                console.log('Raw Email:\n', rawEmail); // Log raw email for debugging
-                const parsed = await simpleParser(rawEmail);
-                console.log('Parsed email:', parsed); // Log parsed email
+              const ticketData = {
+                subject,
+                sender: senderEmail,
+                content,
+                messageId,
+                inReplyTo,
+                references,
+                status: 'pendiente',
+                history: [],
+                date: new Date(),
+              };
 
-                // Use parseSender to extract the email only, ignoring name
-                const email = parseSender(parsed.from.text); // Applying parseSender function
-                console.log('Parsed sender email:', email); // Debug log for sender email
+              let ticket = null;
 
-                // Extract other email details
-                let messageId = parsed.messageId || `<${uuidv4()}@yourdomain.com>`; // Default to UUID if messageId is missing
-                console.log('Parsed messageId:', messageId); // Log messageId for debugging
-                const inReplyTo = parsed.inReplyTo || null;
-                const references = parsed.references || [];
-                let content = parsed.text || parsed.html || 'No Content';
+              // Check for an existing ticket using `inReplyTo` or `references`
+              if (inReplyTo) {
+                ticket = await Ticket.findOne({ messageId: inReplyTo });
+              }
+              if (!ticket && references.length > 0) {
+                ticket = await Ticket.findOne({ messageId: { $in: references } });
+              }
 
-                if (content === 'No Content') {
-                  console.log('Email appears to have no content.');
-                }
+              // Create or update ticket
+              if (!ticket) {
+                console.log('Creating a new ticket...');
+                ticket = new Ticket(ticketData);
+              } else {
+                console.log(`Updating existing ticket ID: ${ticket._id}`);
+                ticket.status = 'en proceso';
+                ticket.history.push({
+                  content,
+                  date: new Date(),
+                  sender: senderEmail,
+                  messageId,
+                  inReplyTo,
+                  references: [...ticket.references, ...references],
+                });
+                ticket.references = [...new Set([...ticket.references, ...references])];
+              }
 
-                // Check for an existing ticket
-                let ticket = null;
-                if (inReplyTo) {
-                  ticket = await Ticket.findOne({ messageId: inReplyTo });
-                }
-                if (!ticket && references.length > 0) {
-                  ticket = await Ticket.findOne({ messageId: { $in: references } });
-                }
-
-                if (!ticket) {
-                  // Create a new ticket if none is found
-                  ticket = new Ticket({
-                    subject: parsed.subject || 'No Subject',
-                    sender: email,      // Use email only
-                    content: content,
-                    messageId, // Use messageId from email or UUID
-                    inReplyTo: null,
-                    references: [],
-                    status: 'pendiente',
-                    history: [],  // Start with empty history for new tickets
-                    date: new Date(),
-                  });
-                } else {
-                  // Update the existing ticket if a reply is found
-                  ticket.status = 'en proceso';
-                  ticket.history.push({
-                    content: content,
-                    date: new Date(),
-                    sender: email,        // Use email only for history
-                    messageId,
-                    inReplyTo,
-                    references: [...ticket.references, ...references],
-                  });
-
-                  // Ensure references are unique
-                  ticket.references = [...new Set([...ticket.references, ...references])];
-                }
-
-                await ticket.save();
-                console.log('Saved ticket:', ticket); // Log saved ticket with messageId
-              });
+              // Save to database
+              await ticket.save();
+              console.log(`Ticket saved successfully: ${ticket._id}`);
             } catch (err) {
-              console.error('Error processing email:', err);
+              console.error(`Error processing message #${seqno}:`, err);
             }
           });
         });
 
-        fetch.once('end', () => {
-          console.log('Finished fetching emails');
-          imap.end();
+        msg.once('end', () => {
+          console.log(`Finished processing message #${seqno}`);
         });
       });
+
+      fetch.once('error', (err) => {
+        console.error('Error during email fetching:', err);
+      });
+
+      fetch.once('end', () => {
+        console.log('Finished fetching unseen emails.');
+
+        // Explicitly reset unseen status for fetched emails
+        imap.addFlags(results, '\\Seen', (err) => {
+          if (err) {
+            console.error('Error resetting unseen flags:', err);
+          } else {
+            console.log('Ensured emails remain unseen.');
+          }
+        });
+
+        imap.end();
+      });
     });
-  } else {
-    console.log('IMAP connection already established, skipping sync.');
-  }
+  });
 };
 
-
-
-
-
-
-// Function to check trash folder and delete tickets
+// Check Trash for Deleted Emails
 const checkTrashFolder = () => {
   imap.openBox('Trash', true, (err, box) => {
     if (err) {
@@ -703,15 +705,15 @@ const checkTrashFolder = () => {
 
       fetch.once('end', () => {
         console.log('Finished fetching emails from Trash');
-        imap.end(); // Close IMAP connection after fetch is done
+        imap.end();
       });
     });
   });
 };
 
 // Schedule cron jobs to check inbox and trash every 5 minutes
-cron.schedule('*/5 * * * *', () => {
-  console.log('Running cron job to check Inbox and Trash folders...');
+cron.schedule('* * * * *', () => {
+  console.log('Corriendo el cron job para chequear Inbox y Trash folders...');
   if (!isConnected) {
     console.log('Not connected. Attempting to reconnect...');
     reconnectImap(); // Reconnect IMAP if disconnected
@@ -723,12 +725,13 @@ cron.schedule('*/5 * * * *', () => {
 });
 
 
-// Start the IMAP connection
+registerImapEventHandlers();
 imap.connect();
 
-  Ticket.find({}).then(tickets => {
-    console.log("Tickets in DB:", tickets);
-  });
+
+  //  Ticket.find({}).then(tickets => {
+  //    console.log("Tickets in DB:", tickets);
+  //  });
 
 
 app.listen(port, () => {
