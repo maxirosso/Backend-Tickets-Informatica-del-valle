@@ -9,6 +9,7 @@ const Imap = require('imap');
 const { simpleParser } = require('mailparser');
 const cron = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
+const sanitizeHtml = require('sanitize-html');
 
 
 dotenv.config();
@@ -495,11 +496,19 @@ const reconnectImap = () => {
 
   if (reconnectAttempts > 5) {
     console.error('Max reconnection attempts reached. Please check your IMAP server connection.');
+    console.log('Waiting for 5 minutes before retrying...');
+
+    // Wait for 5 minutes (300000 ms) before retrying
+    setTimeout(() => {
+      reconnectAttempts = 0; // Reset reconnection attempts
+      console.log('Retrying connection...');
+      imap.connect();  // Attempt reconnection
+    }, 300000); // 5 minutes (300,000 milliseconds)
     return;
   }
 
   console.log(`Reconnecting IMAP... Attempt ${reconnectAttempts}`);
-  
+
   // Remove all existing event listeners to avoid duplicates
   imap.removeAllListeners();
 
@@ -523,7 +532,7 @@ const registerImapEventHandlers = () => {
 
     if (err.code === 'ECONNRESET') {
       console.log('Connection reset. Attempting to reconnect...');
-      reconnectImap();
+      setTimeout(reconnectImap, 5000); // Add a delay before attempting to reconnect
     } else {
       console.error('An unexpected error occurred:', err);
     }
@@ -532,9 +541,30 @@ const registerImapEventHandlers = () => {
   imap.once('close', (hadError) => {
     console.log(`IMAP connection closed${hadError ? ' due to an error' : ''}`);
     isConnected = false;
-    reconnectImap();
+    setTimeout(reconnectImap, 5000); // Add a delay before attempting to reconnect
   });
 };
+
+
+// Function to clean Microsoft Word or rich-text specific tags
+const cleanWordMarkup = (content) => {
+  // Regular expression to remove Word-specific tags and unnecessary attributes
+  const wordTagsPattern = /<w:[^>]+>|<\/w:[^>]+>/g;
+  return content.replace(wordTagsPattern, '');
+};
+
+// Function to sanitize HTML (if content contains HTML) and remove any unwanted tags
+const sanitizeEmailContent = (content) => {
+  return sanitizeHtml(content, {
+    allowedTags: [ 'b', 'i', 'u', 'strong', 'em', 'a', 'p', 'ul', 'ol', 'li', 'br', 'img' ], // List of allowed tags
+    allowedAttributes: {
+      'a': [ 'href', 'name', 'target' ], // Allowed attributes for <a> tags
+      'img': [ 'src', 'alt' ],           // Allowed attributes for <img> tags
+    },
+  });
+};
+
+
 
 // Parse Sender Email Helper
 const parseSender = (senderString) => {
@@ -542,57 +572,111 @@ const parseSender = (senderString) => {
   return (parts[1] ? parts[1].replace('>', '').trim() : parts[0].trim()) || 'Unknown Sender';
 };
 
-// Check Inbox for Unseen Emails
+
+
+const processedMessages = new Set();
+
+const spanishKeywords = ["consulta", "duda", "pregunta", "ayuda", "soporte", "asistencia", "necesito ayuda", "urgente", "¿puedes ayudarme?", "¿me podrías ayudar?", "necesito saber", "¿tienes información sobre?", "favor de", "por favor", "¿cómo puedo...?", "¿qué debo hacer?", "necesito asistencia", "solicitar ayuda", "¿puedo hacer una consulta?", "¿tienes alguna solución para...?", "¿puedes orientarme?", "requerimiento", "¿puedo preguntar algo?", "¿hay alguna respuesta para...?", "problema", "atención", "reclamo", "notificación", "inconveniente", "sugerencia", "necesito información", "pregunto", "preguntar", "consulta urgente", "requiere respuesta", "me interesa saber", "me gustaría saber", "¿puedo obtener ayuda?", "solicito asistencia", "respuesta", "¿puedo obtener más detalles?", "alexis", "maximo", "ludmila"];
+
 const checkInboxFolder = () => {
   console.log('Checking inbox...');
+
   if (!isConnected) {
     console.log('IMAP connection is not established. Skipping sync.');
     return;
   }
 
-  imap.openBox('INBOX', true, (err, box) => {
+  // Open the inbox in "read-only" mode to ensure we don't modify any flags
+  imap.openBox('Inbox', true, (err, box) => {  // Use 'true' for read-only mode
     if (err) {
       console.error('Error opening INBOX:', err);
       return;
     }
     console.log('Inbox opened in read-only mode:', box.name);
 
+    // Search for only "UNSEEN" emails to fetch new emails
     imap.search(['UNSEEN'], async (err, results) => {
       if (err) {
         console.error('Error searching for emails:', err);
         return;
       }
+
+      console.log('UNSEEN email IDs:', results);
+
       if (!results || results.length === 0) {
         console.log('No unseen emails found.');
         return;
       }
 
-      console.log(`Found ${results.length} unseen email(s). Processing...`);
+      console.log(`Found ${results.length} unseen email(s). Fetching emails...`);
 
       const fetch = imap.fetch(results, {
-        bodies: ['HEADER.FIELDS (FROM SUBJECT MESSAGE-ID IN-REPLY-TO REFERENCES)', 'TEXT'],
+        bodies: ['HEADER.FIELDS (FROM SUBJECT MESSAGE-ID IN-REPLY-TO REFERENCES)', 'TEXT', ''],
         struct: true,
-        markSeen: false, // Ensure emails remain unseen
+        markSeen: false,  // Explicitly avoid marking as seen during fetch
       });
+      console.log('Mark Seen:', false);
+      
 
       fetch.on('message', (msg, seqno) => {
         console.log(`Processing message #${seqno}`);
         let rawEmail = '';
 
-        msg.on('body', (stream) => {
+        // Check the flags of the message as soon as the message is received
+        msg.on('flags', (flags) => {
+          console.log(`Flags for message #${seqno}:`, flags);
+        });
+
+        msg.on('body', (stream, parsed) => {
+          // Handling email body part (either TEXT or HTML)
           stream.on('data', (chunk) => {
             rawEmail += chunk.toString();
           });
 
           stream.once('end', async () => {
             try {
-              const parsed = await simpleParser(rawEmail);
-              const senderEmail = parseSender(parsed.from?.text || '');
-              const messageId = parsed.messageId || `<${uuidv4()}@yourdomain.com>`;
-              const inReplyTo = parsed.inReplyTo || null;
-              const references = parsed.references || [];
-              const subject = parsed.subject || 'No Subject';
-              const content = parsed.text || parsed.html || 'No Content';
+              console.log('Parsing email...');
+              const parsedEmail = await simpleParser(rawEmail);
+              const senderEmail = parseSender(parsedEmail.from?.text || '');
+              const messageId = parsedEmail.messageId || `<${uuidv4()}@yourdomain.com>`; // Generate fallback ID
+              const inReplyTo = parsedEmail.inReplyTo || null;
+              const references = parsedEmail.references || [];
+              const subject = parsedEmail.subject || 'No Subject';
+              let content = parsedEmail.text || parsedEmail.html || 'No Content';
+
+              console.log(`Parsed message details:`, { senderEmail, content, messageId, inReplyTo, references, subject });
+
+              // Clean up Word-specific and other unwanted tags in the content
+              content = cleanWordMarkup(content);
+
+              // Sanitize HTML content if it's HTML
+              if (parsedEmail.html) {
+                content = sanitizeEmailContent(content);
+              }
+
+              // Check for Spanish keywords in both subject and content
+              const hasSpanishKeywords = spanishKeywords.some(keyword =>
+                subject.toLowerCase().includes(keyword) || content.toLowerCase().includes(keyword)
+              );
+
+              if (!hasSpanishKeywords) {
+                console.log('Email does not contain Spanish keywords in subject or content. Skipping ticket creation.');
+                return; // Skip creating a ticket if no Spanish keywords are found
+              }
+
+              // Check if messageId is available before processing
+              if (!messageId) {
+                console.error('Message ID is missing. Skipping email...');
+                return; // Skip the email if messageId is missing
+              }
+
+              // Check if the message ID has already been processed
+              if (processedMessages.has(messageId)) {
+                console.log(`Message ID ${messageId} already processed. Skipping.`);
+                return;
+              }
+
+              processedMessages.add(messageId);
 
               const ticketData = {
                 subject,
@@ -606,37 +690,52 @@ const checkInboxFolder = () => {
                 date: new Date(),
               };
 
-              let ticket = null;
+              // Check if ticket already exists
+              let ticket = await Ticket.findOne({
+                $or: [
+                  { messageId },
+                  { messageId: inReplyTo },
+                  { messageId: { $in: references } },
+                ],
+              });
 
-              // Check for an existing ticket using `inReplyTo` or `references`
-              if (inReplyTo) {
-                ticket = await Ticket.findOne({ messageId: inReplyTo });
-              }
-              if (!ticket && references.length > 0) {
-                ticket = await Ticket.findOne({ messageId: { $in: references } });
-              }
-
-              // Create or update ticket
               if (!ticket) {
                 console.log('Creating a new ticket...');
-                ticket = new Ticket(ticketData);
+                ticket = new Ticket(ticketData);  // Create new ticket using the ticket schema
               } else {
                 console.log(`Updating existing ticket ID: ${ticket._id}`);
-                ticket.status = 'en proceso';
-                ticket.history.push({
-                  content,
-                  date: new Date(),
-                  sender: senderEmail,
-                  messageId,
-                  inReplyTo,
-                  references: [...ticket.references, ...references],
-                });
-                ticket.references = [...new Set([...ticket.references, ...references])];
+
+                // Avoid adding duplicate content to history
+                const isAlreadyInHistory = ticket.history.some(
+                  (historyItem) => historyItem.messageId === messageId
+                );
+
+                if (!isAlreadyInHistory) {
+                  ticket.status = 'en proceso';  // Update ticket status to 'in process'
+                  ticket.history.push({
+                    content,
+                    date: new Date(),
+                    sender: senderEmail,
+                    messageId,
+                    inReplyTo,
+                    references: [...ticket.references, ...references],
+                  });
+                  ticket.references = [...new Set([...ticket.references, ...references])];  // Update references
+                }
               }
 
-              // Save to database
+              // Save the ticket to the database
               await ticket.save();
               console.log(`Ticket saved successfully: ${ticket._id}`);
+
+              // After processing, explicitly mark email as unseen
+              imap.addFlags(seqno, '\\UNSEEN', (err) => {
+                if (err) {
+                  console.error('Error marking email as unseen:', err);
+                } else {
+                  console.log('Email marked as unseen successfully.');
+                }
+              });
             } catch (err) {
               console.error(`Error processing message #${seqno}:`, err);
             }
@@ -654,21 +753,13 @@ const checkInboxFolder = () => {
 
       fetch.once('end', () => {
         console.log('Finished fetching unseen emails.');
-
-        // Explicitly reset unseen status for fetched emails
-        imap.addFlags(results, '\\Seen', (err) => {
-          if (err) {
-            console.error('Error resetting unseen flags:', err);
-          } else {
-            console.log('Ensured emails remain unseen.');
-          }
-        });
-
-        imap.end();
       });
     });
   });
 };
+
+
+
 
 // Check Trash for Deleted Emails
 const checkTrashFolder = () => {
@@ -678,23 +769,37 @@ const checkTrashFolder = () => {
       return;
     }
 
+    // Search for all emails in Trash folder (can filter as necessary)
     imap.search(['ALL'], async (err, results) => {
       if (err) {
         console.log('Error searching for emails in Trash:', err);
         return;
       }
 
+      // If no emails are found in Trash, just return
+      if (!results || results.length === 0) {
+        console.log('No emails found in Trash.');
+        return;
+      }
+
+      console.log(`Found ${results.length} email(s) in Trash. Processing...`);
+
       const fetch = imap.fetch(results, { bodies: '' });
 
       fetch.on('message', (msg, seqno) => {
         msg.on('body', async (stream) => {
           try {
+            // Parse the email
             const parsed = await simpleParser(stream);
             const messageId = parsed.messageId;
+
+            // If messageId exists and the email is found in MongoDB, delete it
             if (messageId) {
-              const ticket = await Ticket.findOneAndDelete({ messageId });
+              const ticket = await Ticket.findOne({ messageId });
               if (ticket) {
-                console.log(`Ticket ${messageId} deleted from MongoDB`);
+                console.log(`Ticket with messageId ${messageId} found in MongoDB. Deleting ticket.`);
+                await Ticket.deleteOne({ messageId });
+                console.log(`Ticket with messageId ${messageId} deleted from MongoDB.`);
               }
             }
           } catch (err) {
@@ -705,7 +810,7 @@ const checkTrashFolder = () => {
 
       fetch.once('end', () => {
         console.log('Finished fetching emails from Trash');
-        imap.end();
+        imap.end(); // Close connection after fetching
       });
     });
   });
