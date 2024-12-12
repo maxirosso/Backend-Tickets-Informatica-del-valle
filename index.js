@@ -760,30 +760,38 @@ const checkInboxFolder = async () => {
             
             // Fallback check with more flexible matching
             if (!ticket) {
+              console.log("No ticket found in primary search. Initiating fallback search...");
+            
+              // Execute the fallback search
               ticket = await Ticket.findOne({
                 $or: [
-                  { subject: { $regex: subject, $options: 'i' } }, // Case-insensitive subject match
-                  { sender: senderEmail },
+                  // Exact subject match and same sender
+                  { $and: [
+                    { subject: { $regex: `^${subject}$`, $options: 'i' } }, 
+                    { sender: senderEmail } 
+                  ] },
                   ...(inReplyTo ? [
+                    // Match inReplyTo with references
                     { references: { $in: [inReplyTo] } },
                     { 'history.references': { $in: [inReplyTo] } }
                   ] : []),
                   ...(references && references.length > 0 ? [
+                    // Match references if available
                     { references: { $in: references } },
                     { 'history.references': { $in: references } }
                   ] : [])
-                ],
+                ]
               });
             
-              console.log('Fallback search conditions:', { 
-                subject, 
-                senderEmail, 
-                inReplyTo, 
-                references 
+              // Log fallback search parameters and results
+              console.log('Fallback search conditions:', {
+                subject: `^${subject}$`,
+                sender: senderEmail,
+                inReplyTo,
+                references,
               });
               console.log('Found ticket in fallback search:', ticket);
             }
-            
             
             
             if (!ticket) {
