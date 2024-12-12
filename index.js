@@ -262,74 +262,105 @@ app.post('/tickets', auth, async (req, res) => {
       return res.status(404).json({ message: "Ticket no encontrado" });
     }
 
-    // Determine the message to reply to
-    let replyToMessage = ticket.history[0];  // Default to the first message
+    // Ensure the ticket's history exists and is an array
+    ticket.history = ticket.history || [];
 
-    // If we're replying to a specific message, use its `messageId` to find it
+    // Find the message to reply to
+    // If no messageId is provided or not found, default to the first message
+    let replyToMessage = ticket.history.length > 0 
+      ? ticket.history[0] 
+      : { 
+          messageId: ticket.messageId || generateMessageId(), 
+          references: [] 
+        };
+
+    // If a specific messageId is provided, try to find that message
     if (messageId) {
-      replyToMessage = ticket.history.find(msg => msg.messageId === messageId);
+      const foundMessage = ticket.history.find(msg => msg.messageId === messageId);
+      if (foundMessage) {
+        replyToMessage = foundMessage;
+      }
     }
 
-    if (!replyToMessage) {
-      return res.status(404).json({ message: "El mensaje al que estás respondiendo no se encontró en el historial." });
-    }
-
-    // Prepare inReplyTo and references fields
-    const inReplyTo = replyToMessage.messageId;  // Use the original message's messageId
-    const references = [inReplyTo, ...replyToMessage.references || []]; // Add previous references
+    // Prepare references - combine existing references and the original message ID
+    const references = [
+      ...(replyToMessage.references || []),
+      replyToMessage.messageId
+    ];
 
     // Construct the new reply object
     const newReply = {
       content: replyMessage,
       date: new Date(),
-      sender: req.user.username || "System", // Use the sender's name
-      messageId: messageId || generateMessageId(), // Generate a new messageId if not provided
-      inReplyTo, // Link to the original message
-      references: references, // Add references to previous messages
+      sender: req.user.username || req.user.email || "System",
+      messageId: `reply-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      inReplyTo: replyToMessage.messageId,
+      references: references
     };
 
-    // Add the reply to the ticket's history
+    // Add the new reply to the ticket's history
     ticket.history.push(newReply);
 
-    // Set the status of the ticket (if provided)
-    ticket.status = status || "Pendiente"; // Use the status from the request or default to "Pendiente"
+    // Update the ticket status if provided
+    if (status) {
+      ticket.status = status;
+    }
 
     // Save the updated ticket
     const updatedTicket = await ticket.save();
 
-    // Send email notification (if necessary)
-    const transporter = nodemailer.createTransport({
-      host: "mr.fibercorp.com.ar",
-      port: 465,
-      secure: true,
-      auth: {
-        user: process.env.EMAIL,
-        pass: process.env.PASSWORD,
-      },
-      tls: { rejectUnauthorized: false },
-    });
+    // Optional: Send email notification
+    try {
+      const transporter = nodemailer.createTransport({
+        host: "mr.fibercorp.com.ar",
+        port: 465,
+        secure: true,
+        auth: {
+          user: process.env.EMAIL,
+          pass: process.env.PASSWORD,
+        },
+        tls: { rejectUnauthorized: false },
+      });
 
-    const mailOptions = {
-      from: process.env.EMAIL,
-      to: ticket.sender,
-      subject: `Re: ${ticket.subject}`,
-      text: `Has recibido una nueva respuesta: \n\n${replyMessage}`,
-      headers: {
-        'In-Reply-To': replyToMessage.messageId, // Message ID of the original email
-        References: references.join(' '), // All message IDs in the thread, space-separated
-      },
+      const mailOptions = {
+        from: process.env.EMAIL,
+        to: ticket.sender,
+        subject: `Re: ${ticket.subject}`,
+        text: `${replyMessage}\n\nSaludos,\nEl equipo de Informatica`,
+        headers: {
+          'In-Reply-To': replyToMessage.messageId,
+          'References': references.join(' ')
+        },
+      };
+
+      await transporter.sendMail(mailOptions);
+    } catch (emailErr) {
+      console.error("Error enviando notificación por email:", emailErr);
+    }
+
+    // Prepare response, preserving original ticket content
+    const responseTicket = {
+      ...updatedTicket.toObject(),
+      content: ticket.content,
+      history: updatedTicket.history,
     };
-    
 
-    await transporter.sendMail(mailOptions);
+    res.status(200).json(responseTicket);
 
-    // Respond with the updated ticket
-    res.status(200).json(updatedTicket);
   } catch (err) {
     console.error("Error al responder al ticket:", err.message);
-    res.status(500).json({ message: "Error al responder al ticket", error: err.message });
+    res.status(500).json({ 
+      message: "Error al responder al ticket", 
+      error: err.message 
+    });
   }
 });
+
+// Utility function to generate message ID if not provided
+function generateMessageId() {
+  return `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
+
 
 
 
