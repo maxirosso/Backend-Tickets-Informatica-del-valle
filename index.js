@@ -266,42 +266,28 @@ app.post('/tickets', auth, async (req, res) => {
     ticket.history = ticket.history || [];
 
     // Find the message to reply to
-    // If no messageId is provided or not found, default to the first message
-    let replyToMessage = ticket.history.length > 0 
-      ? ticket.history[0] 
-      : { 
-          messageId: ticket.messageId || generateMessageId(), 
-          references: [] 
-        };
+    let replyToMessage = ticket.history.find(msg => msg.messageId === messageId) || {
+      messageId: ticket.messageId || generateMessageId(),
+      references: []
+    };
 
-    // If a specific messageId is provided, try to find that message
-    if (messageId) {
-      const foundMessage = ticket.history.find(msg => msg.messageId === messageId);
-      if (foundMessage) {
-        replyToMessage = foundMessage;
-      }
-    }
-
-    // Prepare references - combine existing references and the original message ID
-    const references = [
-      ...(replyToMessage.references || []),
-      replyToMessage.messageId
-    ];
+    // Prepare references for threading
+    const references = [...(replyToMessage.references || []), replyToMessage.messageId];
 
     // Construct the new reply object
     const newReply = {
       content: replyMessage,
       date: new Date(),
       sender: req.user.username || req.user.email || "System",
-      messageId: `reply-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      messageId: `reply-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
       inReplyTo: replyToMessage.messageId,
       references: references
     };
 
-    // Add the new reply to the ticket's history
+    // Add the new reply to the ticket's history (without altering original content)
     ticket.history.push(newReply);
 
-    // Update the ticket status if provided
+    // Update status if provided
     if (status) {
       ticket.status = status;
     }
@@ -309,7 +295,7 @@ app.post('/tickets', auth, async (req, res) => {
     // Save the updated ticket
     const updatedTicket = await ticket.save();
 
-    // Optional: Send email notification
+    // Send email notification
     try {
       const transporter = nodemailer.createTransport({
         host: "mr.fibercorp.com.ar",
@@ -338,14 +324,12 @@ app.post('/tickets', auth, async (req, res) => {
       console.error("Error enviando notificación por email:", emailErr);
     }
 
-    // Prepare response, preserving original ticket content
-    const responseTicket = {
+    // Return the ticket with the original content and updated history (which contains the replies only)
+    res.status(200).json({
       ...updatedTicket.toObject(),
-      content: ticket.content,
-      history: updatedTicket.history,
-    };
-
-    res.status(200).json(responseTicket);
+     
+      history: ticket.history // Only the replies are in the history
+    });
 
   } catch (err) {
     console.error("Error al responder al ticket:", err.message);
@@ -356,10 +340,10 @@ app.post('/tickets', auth, async (req, res) => {
   }
 });
 
-// Utility function to generate message ID if not provided
 function generateMessageId() {
-  return `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  return `msg-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
 }
+
 
 
 
@@ -751,12 +735,6 @@ const checkInboxFolder = async () => {
               ],
             });
             
-            console.log('First ticket search conditions:', { 
-              messageId, 
-              inReplyTo, 
-              references 
-            });
-            console.log('Found ticket in first search:', ticket);
             
             // Fallback check with more flexible matching
             if (!ticket) {
@@ -783,14 +761,6 @@ const checkInboxFolder = async () => {
                 ]
               });
             
-              // Log fallback search parameters and results
-              console.log('Fallback search conditions:', {
-                subject: `^${subject}$`,
-                sender: senderEmail,
-                inReplyTo,
-                references,
-              });
-              console.log('Found ticket in fallback search:', ticket);
             }
             
             
